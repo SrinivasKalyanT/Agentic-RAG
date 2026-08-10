@@ -1,4 +1,5 @@
 # api/query.py
+import asyncio
 import json
 
 from fastapi import APIRouter
@@ -46,6 +47,7 @@ async def query_stream(request: QueryRequest):
         answer = result.get("answer", "")
         for chunk in answer.splitlines(keepends=True):
             yield f"data: {chunk.rstrip()}\n\n"
+            await asyncio.sleep(0)
         if "citations" in result:
             citations = result["citations"]
             yield "event: citations\n"
