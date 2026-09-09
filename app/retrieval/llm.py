@@ -3,7 +3,6 @@ import os
 import time
 from typing import Iterator
 
-import requests
 from groq import Groq
 
 from app.retrieval.cache import (
@@ -13,113 +12,14 @@ from app.retrieval.cache import (
     set_cached,
 )
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-FALLBACK_MODEL = os.getenv("FALLBACK_LLM_MODEL", "llama3.2:3b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-
-client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
+# client = Groq(
+#     api_key=os.getenv("GROQ_API_KEY")
+# )
 
 
-def _call_groq(prompt: str) -> str:
-    if client is None:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    return response.choices[0].message.content or ""
-
-
-def _call_groq_stream(prompt: str) -> Iterator[str]:
-    if client is None:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        stream=True,
-    )
-
-    for chunk in response:
-        if not getattr(chunk, "choices", None):
-            continue
-        delta = chunk.choices[0].delta
-        if delta is None:
-            continue
-        text = getattr(delta, "content", None)
-        if text:
-            yield text
-
-
-def _call_ollama(prompt: str) -> str:
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        json={"model": FALLBACK_MODEL, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("response", "")
-
-
-def _call_ollama_stream(prompt: str) -> Iterator[str]:
-    with requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        json={"model": FALLBACK_MODEL, "prompt": prompt, "stream": True},
-        timeout=120,
-        stream=True,
-    ) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
-            if not line:
-                continue
-            payload = json.loads(line)
-            text = payload.get("response", "")
-            if text:
-                yield text
-
-
-def _generate_with_fallback(prompt: str) -> str:
-    last_error = None
-
-    if client is not None:
-        try:
-            return _call_groq(prompt)
-        except Exception as exc:  # pragma: no cover - exercised in runtime
-            last_error = exc
-
-    try:
-        return _call_ollama(prompt)
-    except Exception as exc:  # pragma: no cover - exercised in runtime
-        last_error = exc
-
-    raise RuntimeError(
-        f"LLM generation failed via Groq and Ollama: {last_error}"
-    ) from last_error
-
-
-def _generate_with_fallback_stream(prompt: str) -> Iterator[str]:
-    last_error = None
-
-    if client is not None:
-        try:
-            yield from _call_groq_stream(prompt)
-            return
-        except Exception as exc:  # pragma: no cover - exercised in runtime
-            last_error = exc
-
-    try:
-        yield from _call_ollama_stream(prompt)
-        return
-    except Exception as exc:  # pragma: no cover - exercised in runtime
-        last_error = exc
-
-    raise RuntimeError(
-        f"LLM streaming failed via Groq and Ollama: {last_error}"
-    ) from last_error
+client = Groq(
+    api_key="GROQ_API_KEY",
+)
 
 
 def build_generate_answer_prompt(question: str, context: str) -> str:
@@ -149,7 +49,7 @@ def generate_answer(question: str, context: str):
     if cached is not None:
         latency_ms = (time.time() - start) * 1000
         record_llm_call(
-            model=GROQ_MODEL,
+            model="openai/gpt-oss-120b",
             prompt=prompt,
             response=cached,
             latency_ms=latency_ms,
@@ -158,11 +58,16 @@ def generate_answer(question: str, context: str):
         )
         return cached
 
-    output = _generate_with_fallback(prompt)
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    output = response.choices[0].message.content
     latency_ms = (time.time() - start) * 1000
     set_cached("llm_responses", cache_key, output)
     record_llm_call(
-        model=GROQ_MODEL,
+        model="openai/gpt-oss-120b",
         prompt=prompt,
         response=output,
         latency_ms=latency_ms,
@@ -188,10 +93,24 @@ def generate_llm_response_stream(prompt: str) -> Iterator[str]:
         yield cached
         return
 
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        stream=True,
+    )
+
     partial_output = []
-    for chunk in _generate_with_fallback_stream(prompt):
-        partial_output.append(chunk)
-        yield chunk
+    for chunk in response:
+        if not getattr(chunk, "choices", None):
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        text = getattr(delta, "content", None)
+        if text:
+            partial_output.append(text)
+            yield text
 
     output = "".join(partial_output)
     latency_ms = (time.time() - start) * 1000
@@ -223,7 +142,7 @@ relevant and 1 means fully relevant.
     if cached is not None:
         latency_ms = (time.time() - start) * 1000
         record_llm_call(
-            model=GROQ_MODEL,
+            model="openai/gpt-oss-120b",
             prompt=prompt,
             response=cached,
             latency_ms=latency_ms,
@@ -232,11 +151,16 @@ relevant and 1 means fully relevant.
         )
         return cached
 
-    output = _generate_with_fallback(prompt)
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    output = response.choices[0].message.content
     latency_ms = (time.time() - start) * 1000
     set_cached("llm_responses", cache_key, output)
     record_llm_call(
-        model=GROQ_MODEL,
+        model="openai/gpt-oss-120b",
         prompt=prompt,
         response=output,
         latency_ms=latency_ms,
@@ -272,7 +196,7 @@ Return a JSON object ONLY with these fields:
     if cached is not None:
         latency_ms = (time.time() - start) * 1000
         record_llm_call(
-            model=GROQ_MODEL,
+            model="openai/gpt-oss-120b",
             prompt=prompt,
             response=cached,
             latency_ms=latency_ms,
@@ -281,11 +205,16 @@ Return a JSON object ONLY with these fields:
         )
         return cached
 
-    output = _generate_with_fallback(prompt)
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    output = response.choices[0].message.content
     latency_ms = (time.time() - start) * 1000
     set_cached("llm_responses", cache_key, output)
     record_llm_call(
-        model=GROQ_MODEL,
+        model="openai/gpt-oss-120b",
         prompt=prompt,
         response=output,
         latency_ms=latency_ms,
@@ -301,7 +230,7 @@ def generate_llm_response(prompt: str):
     if cached is not None:
         latency_ms = (time.time() - start) * 1000
         record_llm_call(
-            model=GROQ_MODEL,
+            model="openai/gpt-oss-120b",
             prompt=prompt,
             response=cached,
             latency_ms=latency_ms,
@@ -310,11 +239,16 @@ def generate_llm_response(prompt: str):
         )
         return cached
 
-    output = _generate_with_fallback(prompt)
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    output = response.choices[0].message.content
     latency_ms = (time.time() - start) * 1000
     set_cached("llm_responses", cache_key, output)
     record_llm_call(
-        model=GROQ_MODEL,
+        model="openai/gpt-oss-120b",
         prompt=prompt,
         response=output,
         latency_ms=latency_ms,

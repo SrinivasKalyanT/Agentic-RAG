@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Literal
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -6,7 +7,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.prompts.agentic_rag_prompts import _DECIDE_SYSTEM
-from app.retrieval.cache import compute_cache_key, get_cached, set_cached
+from app.retrieval.cache import (
+    compute_cache_key,
+    get_cached,
+    get_semantic_cached,
+    set_cached,
+    set_semantic_cached,
+)
 from app.retrieval.faiss_store import build_context, extract_citations, retrieve_chunks
 from app.retrieval.llm import (
     evaluate_context,
@@ -18,23 +25,69 @@ from app.retrieval.reranker import INITIAL_RETRIEVE_K, rerank_docs
 from app.schemas.query import RAGState
 
 
+# Per-turn scratch fields that must never leak from one turn to the next.
+# The graph is compiled with a checkpointer keyed by chat_id (thread_id),
+# and app/api/query.py's input to graph.invoke/ainvoke only ever supplies
+# `question` and `knowledge_base` - LangGraph reloads the *entire* previous
+# turn's final state first and only overwrites keys present in each node's
+# return value, so anything not reset here keeps last turn's value. That
+# previously let a cache *miss* on `check_cached_answer_node` (which
+# returns {} on a miss, touching nothing) fall through to
+# `route_from_cached_answer` seeing the *previous* turn's leftover
+# `answer` and treating it as this turn's answer, skipping retrieval
+# entirely and returning a stale, unrelated answer. `chat_history` is
+# deliberately excluded - it uses an `add` reducer and is meant to
+# accumulate across turns.
+_TURN_RESET: dict = {
+    "answer": "",
+    "citations": [],
+    "cached_answer": False,
+    "docs": [],
+    "context": "",
+    "summarized_context": "",
+    "relevance_score": 0.0,
+    "verification_score": 0.0,
+    "answer_supported": False,
+    "verification_reasoning": "",
+    "retrieval_attempts": 0,
+    "next_action": "",
+    "agent_reasoning": "",
+    "reranker_scores": [],
+}
+
+
 def memory_inject_node(state: RAGState) -> dict:
     """
-    Prepend the last 3 turns of chat history to the question so the LLM has
-    conversational context when reformulating and generating.
+    Reset the per-turn scratch fields listed in `_TURN_RESET` (see its
+    comment), then prepend the last 3 turns of chat history to the
+    question so the LLM has conversational context when generating the
+    final answer.
+
+    This writes `augmented_question`, not `question`. If it overwrote
+    `question`, every downstream node (reformulate, check_cached_answer,
+    retrieve, agent_decide, cache_answer, verify_answer) would operate on a
+    string dominated by the prior turn's (often much longer) answer text -
+    a topic switch within the same chat_id would then match unrelated
+    cache entries and retrieve unrelated docs, because the embedding of
+    "prior Q + prior long A + new question" is mostly about the prior
+    topic. Only generate_node reads `augmented_question`, so history only
+    ever influences how the final answer is phrased, never what gets
+    retrieved or cache-matched.
     """
+    updates: dict = dict(_TURN_RESET)
+
     history = state.get("chat_history") or []
     if not history:
-        return {}
+        return updates
 
     recent = history[-3:]
     history_text = "\n".join(
         f"User: {h['question']}\nAssistant: {h['answer']}" for h in recent
     )
-    rewritten = (
+    updates["augmented_question"] = (
         f"Conversation so far:\n{history_text}\n\n" f"New question: {state['question']}"
     )
-    return {"question": rewritten}
+    return updates
 
 
 def reformulate_node(state: RAGState) -> dict:
@@ -49,7 +102,7 @@ def reformulate_node(state: RAGState) -> dict:
         return {"question": cached}
 
     reformulated = generate_llm_response(prompt)
-    rewritten = reformulated.strip()
+    rewritten = reformulated.strip()  # type: ignore
     set_cached("rewrite_results", cache_key, rewritten)
     return {"question": rewritten}  # type: ignore
 
@@ -71,14 +124,20 @@ def retrieve_node(state: RAGState) -> dict:
     }
 
 
+def _final_answers_cache_name(knowledge_base) -> str:
+    """Per-knowledge-base cache name so semantic matches never cross KBs."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(knowledge_base))
+    return f"final_answers_semantic__{safe}"
+
+
 def check_cached_answer_node(state: RAGState) -> dict:
     question = state.get("question")
     knowledge_base = state.get("knowledge_base")
     if question is None or knowledge_base is None:
         return {}
 
-    cache_key = compute_cache_key(f"answer:{knowledge_base}:{question}")
-    cached = get_cached("final_answers", cache_key)
+    cache_name = _final_answers_cache_name(knowledge_base)
+    cached = get_semantic_cached(cache_name, question)
     if not cached:
         return {}
 
@@ -232,7 +291,12 @@ def generate_node(state: RAGState):
     if not context:
         raise ValueError("Missing context in state before generating answer")
 
-    answer = generate_answer(question=state["question"], context=context)
+    # Use the history-augmented question (if any) only here, so the answer
+    # can be phrased with conversational context, without that history
+    # having influenced which docs were retrieved or which cache entry
+    # matched - see memory_inject_node.
+    question = state.get("augmented_question") or state["question"]
+    answer = generate_answer(question=question, context=context)
     return {"answer": answer}
 
 
@@ -288,10 +352,10 @@ def cache_answer_node(state: RAGState) -> dict:
     ):
         return {}
 
-    cache_key = compute_cache_key(f"answer:{knowledge_base}:{question}")
-    set_cached(
-        "final_answers",
-        cache_key,
+    cache_name = _final_answers_cache_name(knowledge_base)
+    set_semantic_cached(
+        cache_name,
+        question,
         {
             "answer": answer,
             "citations": citations,
@@ -360,7 +424,6 @@ def build_graph() -> CompiledStateGraph[RAGState, None, RAGState, RAGState]:
     graph_builder.add_edge(START, "memory_inject")
     graph_builder.add_edge("memory_inject", "reformulate")
     graph_builder.add_edge("reformulate", "check_cached_answer")
-    graph_builder.add_edge("check_cached_answer", "retrieve")
     graph_builder.add_edge("retrieve", "rerank")
     graph_builder.add_edge("rerank", "build_context")
     graph_builder.add_edge("build_context", "evaluate_context")

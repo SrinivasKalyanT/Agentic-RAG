@@ -1,9 +1,9 @@
 # services/retrieval/faiss_store.py
 
 from pathlib import Path
-from types import SimpleNamespace
 
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 from app.ingestion.embedder import get_embedding_model
 from app.retrieval.cache import compute_cache_key, get_cached, set_cached
@@ -56,8 +56,11 @@ def _doc_to_serializable(doc) -> dict:
 
 
 def _serializable_to_doc(d: dict):
-    return SimpleNamespace(
-        page_content=d.get("page_content"), metadata=d.get("metadata", {})
+    # A real Document (not SimpleNamespace) - LangGraph's checkpointer needs
+    # to msgpack-serialize `docs` as part of the graph state, and
+    # SimpleNamespace isn't serializable that way, unlike Document.
+    return Document(
+        page_content=d.get("page_content") or "", metadata=d.get("metadata", {})
     )
 
 
