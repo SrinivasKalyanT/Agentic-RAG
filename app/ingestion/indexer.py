@@ -44,7 +44,7 @@ def load_faiss(knowledge_base: str):
 
 
 def load_bm25_docs(knowledge_base: str):
-    bm25_path = BM25_ROOT / knowledge_base / "bm25_docs.pkl"
+    bm25_path = BM25_ROOT / knowledge_base / "documents.pkl"
     if not bm25_path.exists():
         return []
     with open(bm25_path, "rb") as f:

@@ -19,6 +19,7 @@ class Citation(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     citations: list[Citation]
+    cached_answer: bool = False
 
 
 class RAGState(TypedDict):
@@ -27,6 +28,12 @@ class RAGState(TypedDict):
     knowledge_base: Any
 
     chat_history: NotRequired[Annotated[list[dict], add]]
+    # Set by memory_inject_node: `question` with the last few chat_history
+    # turns prepended. Used only when composing the final answer, so a
+    # topic-switching question in an ongoing chat_id can't have a prior
+    # turn's content drag retrieval/cache matching off-topic - see
+    # memory_inject_node and generate_node.
+    augmented_question: NotRequired[str]
 
     # ---- pipeline fields ----
     docs: NotRequired[list]
@@ -41,3 +48,4 @@ class RAGState(TypedDict):
     answer: NotRequired[str]
     next_action: NotRequired[str]
     agent_reasoning: NotRequired[str]  # free-text scratchpad (useful for debugging)
+    cached_answer: NotRequired[bool]  # set by check_cached_answer_node on a cache hit
