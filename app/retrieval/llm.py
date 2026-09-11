@@ -12,14 +12,12 @@ from app.retrieval.cache import (
     set_cached,
 )
 
+from app.core.config import get_settings
+
+
 client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
+    api_key=get_settings().groq_api_key,
 )
-
-
-# client = Groq(
-#     api_key="GROQ_API_KEY",
-# )
 
 
 def build_generate_answer_prompt(question: str, context: str) -> str:

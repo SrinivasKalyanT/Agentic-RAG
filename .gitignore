@@ -18,6 +18,7 @@ pythonenv*/
 .DS_Store
 Thumbs.db
 .env
+config.json
 
 test_file.py
 
